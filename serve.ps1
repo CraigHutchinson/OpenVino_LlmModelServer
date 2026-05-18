@@ -338,6 +338,47 @@ $ovmsArgs = @(
     '--metrics_enable'
 )
 
+# Return process info (Id, Name, Path) for whoever owns a TCP listen port, or $null if free.
+function Get-PortOwner ([int]$Port) {
+    $tcp = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if (-not $tcp) { return $null }
+    $pidNum = $tcp.OwningProcess | Select-Object -First 1
+    $proc = Get-Process -Id $pidNum -ErrorAction SilentlyContinue
+    if (-not $proc) { return [pscustomobject]@{ Pid = $pidNum; Name = '?'; Path = $null } }
+    [pscustomobject]@{ Pid = $proc.Id; Name = $proc.ProcessName; Path = $proc.Path }
+}
+
+# Pre-flight: check the ports OVMS is about to bind. Report clearly which PID owns
+# each conflict and exit before launching, so the user doesn't have to parse OVMS's
+# gRPC-internal error spew (wsa_error 10048 etc.).
+$portsToCheck = @{ 'gRPC' = [int]$cfg.Port; 'REST' = [int]$cfg.RestPort }
+if ($CaptureRequests) { $portsToCheck['Capture proxy'] = [int]$cfg.RestPort + 2 }
+
+$conflicts = @()
+foreach ($label in $portsToCheck.Keys) {
+    $owner = Get-PortOwner $portsToCheck[$label]
+    if ($owner) { $conflicts += [pscustomobject]@{ Label = $label; Port = $portsToCheck[$label]; Owner = $owner } }
+}
+
+if ($conflicts.Count) {
+    Write-Host "`nPort conflict — cannot start OVMS:`n" -ForegroundColor Red
+    foreach ($c in $conflicts) {
+        Write-Host ("  {0,-14} port {1}  →  PID {2}  ({3})" -f $c.Label, $c.Port, $c.Owner.Pid, $c.Owner.Name) -ForegroundColor Yellow
+        if ($c.Owner.Path) { Write-Host ("                                 {0}" -f $c.Owner.Path) -ForegroundColor DarkGray }
+    }
+    # If our own previous instance is the culprit, offer one-liner fix
+    $stale = $conflicts | Where-Object { $_.Owner.Name -eq 'ovms' } | Select-Object -First 1
+    if ($stale) {
+        Write-Host "`n  Looks like a previous OVMS instance is still running. To kill it:" -ForegroundColor Cyan
+        Write-Host "    Get-Process ovms | Stop-Process -Force" -ForegroundColor White
+    } else {
+        Write-Host "`n  To kill the conflicting process:" -ForegroundColor Cyan
+        Write-Host ("    Stop-Process -Id {0} -Force" -f ($conflicts[0].Owner.Pid)) -ForegroundColor White
+    }
+    Write-Host ""
+    return
+}
+
 Write-Host "Starting OVMS..."
 Write-Host "  ovms.exe $($ovmsArgs -join ' ')`n"
 
@@ -519,12 +560,19 @@ if ($LogFile) {
 $reqStartTime  = $null
 $reqPromptToks = 0
 
+# Rolling buffer of recent OVMS output, used for failure diagnostics if the process
+# exits without becoming ready. Caps at 80 lines to keep memory bounded.
+$recentLines = [System.Collections.Generic.Queue[string]]::new()
+$procStart   = [DateTime]::UtcNow
+
 try {
     while (-not $proc.HasExited) {
         $line = $null
         while ($queue.TryDequeue([ref]$line)) {
             Write-Host $line
             if ($resolvedLogFile) { Add-Content -Path $resolvedLogFile -Value $line -Encoding UTF8 }
+            $recentLines.Enqueue($line)
+            while ($recentLines.Count -gt 80) { [void]$recentLines.Dequeue() }
 
             if (-not $ready -and ($line -match 'ServableManagerModule started|state changed to: AVAILABLE')) {
                 $ready = $true
@@ -593,12 +641,70 @@ try {
     if (-not $proc.HasExited) { $proc.Kill() }
     $proc.WaitForExit()
     if ($CaptureRequests -and $captureJob) { Stop-Job $captureJob; Remove-Job $captureJob }
-    # Drain any lines buffered after the loop exited
+    # Drain any lines buffered after the loop exited — keep them in $recentLines too
     $line = $null
     while ($queue.TryDequeue([ref]$line)) {
         Write-Host $line
         if ($resolvedLogFile) { Add-Content -Path $resolvedLogFile -Value $line -Encoding UTF8 }
+        $recentLines.Enqueue($line)
+        while ($recentLines.Count -gt 80) { [void]$recentLines.Dequeue() }
     }
 }
 
 Write-Host "`nOVMS exited (code $($proc.ExitCode))"
+
+# ── Failure diagnostics ───────────────────────────────────────────────────────
+# Run only if OVMS died before serving anything. Pattern-match recent output for
+# known failure modes and report a clear cause + suggested fix.
+$runTime = ([DateTime]::UtcNow - $procStart).TotalSeconds
+if (-not $ready -or ($proc.ExitCode -ne 0 -and $runTime -lt 30)) {
+    $allOutput = ($recentLines -join "`n")
+
+    Write-Host "`n--- Startup failure diagnostics ---" -ForegroundColor Yellow
+    Write-Host ("  Process ran for {0:N1} s before exiting" -f $runTime) -ForegroundColor Yellow
+
+    $diagnosed = $false
+
+    if ($allOutput -match 'wsa_error\D*10048|Only one usage of each socket address|Failed to start gRPC server') {
+        Write-Host "`n  CAUSE: Port already in use." -ForegroundColor Red
+        foreach ($p in @($cfg.Port, $cfg.RestPort)) {
+            $owner = Get-PortOwner $p
+            if ($owner) {
+                Write-Host ("    Port {0} held by PID {1} ({2})" -f $p, $owner.Pid, $owner.Name) -ForegroundColor Yellow
+            }
+        }
+        Write-Host "  FIX:   Get-Process ovms | Stop-Process -Force   (or kill the offending PID above)" -ForegroundColor Cyan
+        $diagnosed = $true
+    }
+
+    if ($allOutput -match 'm_element_type\.is_static') {
+        Write-Host "`n  CAUSE: Device crash — typically AUTO/GPU on an incompatible iGPU." -ForegroundColor Red
+        Write-Host "  FIX:   .\serve.ps1 -Device CPU" -ForegroundColor Cyan
+        $diagnosed = $true
+    }
+
+    if ($allOutput -match 'has no field named|protobuf.*parse|Couldn''t parse plugin config') {
+        Write-Host "`n  CAUSE: Invalid graph.pbtxt — protobuf rejected a field." -ForegroundColor Red
+        Write-Host "  FIX:   Check graph.pbtxt for unknown LLMCalculatorOptions fields" -ForegroundColor Cyan
+        Write-Host "         (e.g. max_output_tokens is NOT valid; use max_num_batched_tokens)" -ForegroundColor Cyan
+        $diagnosed = $true
+    }
+
+    if ($allOutput -match 'CUDA out of memory|bad_alloc|Failed to allocate|out of memory') {
+        Write-Host "`n  CAUSE: Out of memory (likely KV cache during model load)." -ForegroundColor Red
+        Write-Host "  FIX:   Lower -ContextLength, or set -CacheSize to a smaller value" -ForegroundColor Cyan
+        $diagnosed = $true
+    }
+
+    if ($allOutput -match 'No such file or directory|Failed to open|does not exist') {
+        Write-Host "`n  CAUSE: Missing file — model path or graph.pbtxt not found." -ForegroundColor Red
+        Write-Host ("  CHECK: ModelPath = {0}" -f $ModelPath) -ForegroundColor Cyan
+        $diagnosed = $true
+    }
+
+    if (-not $diagnosed) {
+        Write-Host "`n  No known failure pattern matched. Last lines of OVMS output:" -ForegroundColor Yellow
+        $recentLines | Select-Object -Last 15 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    }
+    Write-Host ""
+}
