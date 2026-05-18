@@ -330,11 +330,12 @@ Write-Host @"
 # LLM settings (device, cache_size, context, kv_precision) are patched directly
 # into graph.pbtxt above — passing them as CLI flags causes an immediate exit 3.
 $ovmsArgs = @(
-    '--model_path', $ModelPath
-    '--model_name', $ModelName
-    '--port',       $cfg.Port
-    '--rest_port',  $cfg.RestPort
-    '--log_level',  $cfg.LogLevel
+    '--model_path',    $ModelPath
+    '--model_name',    $ModelName
+    '--port',          $cfg.Port
+    '--rest_port',     $cfg.RestPort
+    '--log_level',     $cfg.LogLevel
+    '--metrics_enable'
 )
 
 Write-Host "Starting OVMS..."
@@ -410,17 +411,16 @@ function Show-MemoryReport ([int]$ProcessId) {
     } catch {}
 }
 
-# Fetch all Prometheus metrics from OVMS into a flat name→value hashtable.
-# Returns $null if the endpoint is unreachable.
+# Fetch Prometheus metrics from OVMS into a flat name→value hashtable.
+# Returns $null if the endpoint is unreachable or metrics aren't enabled.
 function Get-OvmsMetrics ([string]$Url) {
     try {
         $r   = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
         $map = @{}
-        foreach ($line in ($r.Content -split "`n")) {
-            $line = $line.Trim()
-            if ($line.StartsWith('#') -or $line.Length -eq 0) { continue }
-            # Prometheus text: name{labels} value [timestamp]
-            if ($line -match '^([A-Za-z_:][A-Za-z0-9_:{},="]*)\s+(\S+)') {
+        foreach ($rawLine in ($r.Content -split "`n")) {
+            $rawLine = $rawLine.Trim()
+            if ($rawLine.StartsWith('#') -or $rawLine.Length -eq 0) { continue }
+            if ($rawLine -match '^([A-Za-z_:][A-Za-z0-9_:{},="]*)\s+(\S+)') {
                 $val = 0.0
                 if ([double]::TryParse($Matches[2],
                         [System.Globalization.NumberStyles]::Float,
@@ -435,69 +435,56 @@ function Get-OvmsMetrics ([string]$Url) {
     } catch { return $null }
 }
 
-# Display a single PP / TG throughput line when tokens were processed since last poll.
-function Show-ThroughputLine {
-    param(
-        [hashtable] $Curr,
-        [hashtable] $Prev,
-        [double]    $ElapsedSec,
-        [string]    $LogFile
-    )
-    if ($null -eq $Prev -or $ElapsedSec -le 0.01) { return }
+# Display current queue/active load from Prometheus (every 2 s, only when active > 0).
+# OVMS Prometheus metrics don't include token counters, so PP/TG throughput comes
+# from log parsing — see the $reqStartTime / $reqGenToks tracking in the main loop.
+function Show-LoadLine {
+    param([hashtable]$Snap, [string]$LogFile)
+    if ($null -eq $Snap) { return }
 
-    # Locate the relevant cumulative-counter metrics.
-    # OVMS metric names vary by version; try each pattern in priority order.
-    $ppKey = $Curr.Keys | Where-Object {
-        $_ -match 'prompt_tokens|prefill_tokens|input_tokens'
-    } | Sort-Object Length | Select-Object -First 1
-
-    $tgKey = $Curr.Keys | Where-Object {
-        $_ -match 'generation_tokens|decode_tokens|generated_tokens|output_tokens'
-    } | Sort-Object Length | Select-Object -First 1
-
-    $activeKey = $Curr.Keys | Where-Object {
-        $_ -match 'current_requests|running_requests'
-    } | Select-Object -First 1
-
-    $queueKey = $Curr.Keys | Where-Object {
-        $_ -match 'queue_size|waiting_requests|requests_queue'
-    } | Select-Object -First 1
-
-    $ppDelta = if ($ppKey -and $Prev.ContainsKey($ppKey)) { [Math]::Max(0, $Curr[$ppKey] - $Prev[$ppKey]) } else { 0 }
-    $tgDelta = if ($tgKey -and $Prev.ContainsKey($tgKey)) { [Math]::Max(0, $Curr[$tgKey] - $Prev[$tgKey]) } else { 0 }
-
-    if ($ppDelta -le 0 -and $tgDelta -le 0) { return }
-
-    $ppRate  = if ($ppDelta -gt 0) { $ppDelta / $ElapsedSec } else { 0 }
-    $tgRate  = if ($tgDelta -gt 0) { $tgDelta / $ElapsedSec } else { 0 }
-    $active  = if ($activeKey) { [int]$Curr[$activeKey] } else { $null }
-    $queue   = if ($queueKey)  { [int]$Curr[$queueKey]  } else { $null }
-
-    $plain = '  ◆'
-    if ($ppDelta -gt 0) { $plain += '  PP {0,7:N0} t/s' -f $ppRate }
-    if ($tgDelta -gt 0) { $plain += '  TG {0,6:N1} t/s' -f $tgRate }
-    if ($null -ne $active) { $plain += '  | active {0}' -f $active }
-    if ($null -ne $queue)  { $plain += '  queue {0}'    -f $queue  }
-
-    Write-Host '  ◆ ' -NoNewline -ForegroundColor DarkGray
-    if ($ppDelta -gt 0) {
-        Write-Host 'PP ' -NoNewline -ForegroundColor DarkCyan
-        Write-Host ('{0,7:N0} t/s' -f $ppRate) -NoNewline -ForegroundColor Cyan
-        Write-Host '  ' -NoNewline
+    # Actual OVMS metric names (confirmed from binary string analysis)
+    $active = $null; $queue = $null
+    foreach ($k in $Snap.Keys) {
+        if ($k -match 'infer_req_active|current_requests') { $active = [int]$Snap[$k] }
+        if ($k -match 'infer_req_queue_size')              { $queue  = [int]$Snap[$k] }
     }
-    if ($tgDelta -gt 0) {
-        Write-Host 'TG ' -NoNewline -ForegroundColor DarkGreen
-        Write-Host ('{0,6:N1} t/s' -f $tgRate) -NoNewline -ForegroundColor Green
-        Write-Host '  ' -NoNewline
-    }
-    if ($null -ne $active) {
-        Write-Host '| ' -NoNewline -ForegroundColor DarkGray
-        Write-Host "active $active" -NoNewline -ForegroundColor White
-    }
+    if ($null -eq $active -and $null -eq $queue) { return }  # metrics not present
+    if ($active -eq 0 -and ($null -eq $queue -or $queue -eq 0)) { return }  # idle — no noise
+
+    $plain = '  · active {0}  queue {1}' -f $active, ($queue ?? '?')
+    Write-Host '  · ' -NoNewline -ForegroundColor DarkGray
+    Write-Host 'active ' -NoNewline -ForegroundColor DarkGray
+    Write-Host $active   -NoNewline -ForegroundColor White
     if ($null -ne $queue) {
-        Write-Host "  queue $queue" -NoNewline -ForegroundColor DarkGray
+        Write-Host '  queue ' -NoNewline -ForegroundColor DarkGray
+        Write-Host $queue     -NoNewline -ForegroundColor White
     }
     Write-Host ''
+    if ($LogFile) { Add-Content -Path $LogFile -Value $plain -Encoding UTF8 }
+}
+
+# Display per-request PP/TG stats derived from log line timestamps and token counts.
+# promptToks : tokens in the prompt (from "Number of prompt tokens: N" log line)
+# genToks    : tokens generated   (from "Generated tokens: N" log line)
+# elapsedSec : wall-clock time between those two log lines
+function Show-RequestStats {
+    param([int]$PromptToks, [int]$GenToks, [double]$ElapsedSec, [string]$LogFile)
+    if ($ElapsedSec -le 0.1) { return }
+
+    # TG throughput = gen_tokens / total_elapsed  (lower bound; prefill takes some of that time)
+    # PP is reported as token count only — we can't isolate prefill time from the logs alone.
+    $tgRate = $GenToks / $ElapsedSec
+
+    $plain = '  ◆ PP {0,6:N0} tok  TG {1,5:N0} tok [{2:N1} t/s]  {3:N1} s' `
+             -f $PromptToks, $GenToks, $tgRate, $ElapsedSec
+
+    Write-Host '  ◆ ' -NoNewline -ForegroundColor DarkGray
+    Write-Host 'PP ' -NoNewline -ForegroundColor DarkCyan
+    Write-Host ('{0:N0} tok' -f $PromptToks) -NoNewline -ForegroundColor Cyan
+    Write-Host '  TG ' -NoNewline -ForegroundColor DarkGreen
+    Write-Host ('{0:N0} tok' -f $GenToks) -NoNewline -ForegroundColor Green
+    Write-Host (' [{0:N1} t/s]' -f $tgRate) -NoNewline -ForegroundColor Green
+    Write-Host ('  {0:N1} s' -f $ElapsedSec) -ForegroundColor DarkGray
 
     if ($LogFile) { Add-Content -Path $LogFile -Value $plain -Encoding UTF8 }
 }
@@ -518,8 +505,6 @@ if ($CaptureRequests) {
 # Metrics polling state (populated after server ready)
 $metricsUrl      = "http://localhost:$($cfg.RestPort)/metrics"
 $lastMetricsPoll = [DateTime]::MinValue
-$prevMetSnap     = $null
-$prevMetTime     = $null
 
 Write-Host "Waiting for model to load  (Ctrl+C to stop)...`n"
 
@@ -530,19 +515,25 @@ if ($LogFile) {
     Write-Host "  Logging OVMS output to   : $resolvedLogFile`n"
 }
 
+# Per-request token tracking — populated from OVMS log lines
+$reqStartTime  = $null
+$reqPromptToks = 0
+
 try {
     while (-not $proc.HasExited) {
         $line = $null
         while ($queue.TryDequeue([ref]$line)) {
             Write-Host $line
             if ($resolvedLogFile) { Add-Content -Path $resolvedLogFile -Value $line -Encoding UTF8 }
+
             if (-not $ready -and ($line -match 'ServableManagerModule started|state changed to: AVAILABLE')) {
                 $ready = $true
                 Write-Host "`n========================================" -ForegroundColor Green
-                Write-Host "  SERVER READY — sending warmup request" -ForegroundColor Green
+                Write-Host "  SERVER READY" -ForegroundColor Green
                 Write-Host "  REST :$($cfg.RestPort)/v3" -ForegroundColor Green
                 Write-Host "========================================`n"  -ForegroundColor Green
             }
+
             if ($ready -and -not $memDone) {
                 $memDone = $true
                 if ($cfg.Warmup) {
@@ -567,20 +558,31 @@ try {
                 Show-MemoryReport -ProcessId $proc.Id
                 Write-Host ""
             }
+
+            # ── Token throughput from log parsing ────────────────────────────
+            # OVMS Prometheus metrics carry no token counts — PP/TG data comes
+            # from these two log lines that bracket each inference request.
+            if ($ready -and $line -match 'Number of prompt tokens:\s*(\d+)') {
+                $reqStartTime  = [DateTime]::UtcNow
+                $reqPromptToks = [int]$Matches[1]
+            }
+            if ($ready -and $line -match 'Generated tokens:\s*(\d+)') {
+                $genToks = [int]$Matches[1]
+                if ($null -ne $reqStartTime -and $genToks -gt 0) {
+                    $elapsed = ([DateTime]::UtcNow - $reqStartTime).TotalSeconds
+                    Show-RequestStats -PromptToks $reqPromptToks -GenToks $genToks `
+                        -ElapsedSec $elapsed -LogFile $resolvedLogFile
+                }
+                $reqStartTime = $null
+            }
         }
 
-        # Poll /metrics and display PP / TG throughput whenever tokens were processed
+        # Poll /metrics every 2 s to show active/queue load while inference is running
         if ($ready) {
             $now = [DateTime]::UtcNow
             if (($now - $lastMetricsPoll).TotalMilliseconds -ge 2000) {
                 $snap = Get-OvmsMetrics $metricsUrl
-                if ($snap) {
-                    $elapsed = if ($prevMetTime) { ($now - $prevMetTime).TotalSeconds } else { 0 }
-                    Show-ThroughputLine -Curr $snap -Prev $prevMetSnap `
-                        -ElapsedSec $elapsed -LogFile $resolvedLogFile
-                    $prevMetSnap = $snap
-                    $prevMetTime = $now
-                }
+                Show-LoadLine -Snap $snap -LogFile $resolvedLogFile
                 $lastMetricsPoll = $now
             }
         }
