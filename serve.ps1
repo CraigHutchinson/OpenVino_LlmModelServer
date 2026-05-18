@@ -410,6 +410,98 @@ function Show-MemoryReport ([int]$ProcessId) {
     } catch {}
 }
 
+# Fetch all Prometheus metrics from OVMS into a flat name→value hashtable.
+# Returns $null if the endpoint is unreachable.
+function Get-OvmsMetrics ([string]$Url) {
+    try {
+        $r   = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        $map = @{}
+        foreach ($line in ($r.Content -split "`n")) {
+            $line = $line.Trim()
+            if ($line.StartsWith('#') -or $line.Length -eq 0) { continue }
+            # Prometheus text: name{labels} value [timestamp]
+            if ($line -match '^([A-Za-z_:][A-Za-z0-9_:{},="]*)\s+(\S+)') {
+                $val = 0.0
+                if ([double]::TryParse($Matches[2],
+                        [System.Globalization.NumberStyles]::Float,
+                        [System.Globalization.CultureInfo]::InvariantCulture, [ref]$val)) {
+                    if (-not $map.ContainsKey($Matches[1]) -or $map[$Matches[1]] -lt $val) {
+                        $map[$Matches[1]] = $val
+                    }
+                }
+            }
+        }
+        return if ($map.Count) { $map } else { $null }
+    } catch { return $null }
+}
+
+# Display a single PP / TG throughput line when tokens were processed since last poll.
+function Show-ThroughputLine {
+    param(
+        [hashtable] $Curr,
+        [hashtable] $Prev,
+        [double]    $ElapsedSec,
+        [string]    $LogFile
+    )
+    if ($null -eq $Prev -or $ElapsedSec -le 0.01) { return }
+
+    # Locate the relevant cumulative-counter metrics.
+    # OVMS metric names vary by version; try each pattern in priority order.
+    $ppKey = $Curr.Keys | Where-Object {
+        $_ -match 'prompt_tokens|prefill_tokens|input_tokens'
+    } | Sort-Object Length | Select-Object -First 1
+
+    $tgKey = $Curr.Keys | Where-Object {
+        $_ -match 'generation_tokens|decode_tokens|generated_tokens|output_tokens'
+    } | Sort-Object Length | Select-Object -First 1
+
+    $activeKey = $Curr.Keys | Where-Object {
+        $_ -match 'current_requests|running_requests'
+    } | Select-Object -First 1
+
+    $queueKey = $Curr.Keys | Where-Object {
+        $_ -match 'queue_size|waiting_requests|requests_queue'
+    } | Select-Object -First 1
+
+    $ppDelta = if ($ppKey -and $Prev.ContainsKey($ppKey)) { [Math]::Max(0, $Curr[$ppKey] - $Prev[$ppKey]) } else { 0 }
+    $tgDelta = if ($tgKey -and $Prev.ContainsKey($tgKey)) { [Math]::Max(0, $Curr[$tgKey] - $Prev[$tgKey]) } else { 0 }
+
+    if ($ppDelta -le 0 -and $tgDelta -le 0) { return }
+
+    $ppRate  = if ($ppDelta -gt 0) { $ppDelta / $ElapsedSec } else { 0 }
+    $tgRate  = if ($tgDelta -gt 0) { $tgDelta / $ElapsedSec } else { 0 }
+    $active  = if ($activeKey) { [int]$Curr[$activeKey] } else { $null }
+    $queue   = if ($queueKey)  { [int]$Curr[$queueKey]  } else { $null }
+
+    $plain = '  ◆'
+    if ($ppDelta -gt 0) { $plain += '  PP {0,7:N0} t/s' -f $ppRate }
+    if ($tgDelta -gt 0) { $plain += '  TG {0,6:N1} t/s' -f $tgRate }
+    if ($null -ne $active) { $plain += '  | active {0}' -f $active }
+    if ($null -ne $queue)  { $plain += '  queue {0}'    -f $queue  }
+
+    Write-Host '  ◆ ' -NoNewline -ForegroundColor DarkGray
+    if ($ppDelta -gt 0) {
+        Write-Host 'PP ' -NoNewline -ForegroundColor DarkCyan
+        Write-Host ('{0,7:N0} t/s' -f $ppRate) -NoNewline -ForegroundColor Cyan
+        Write-Host '  ' -NoNewline
+    }
+    if ($tgDelta -gt 0) {
+        Write-Host 'TG ' -NoNewline -ForegroundColor DarkGreen
+        Write-Host ('{0,6:N1} t/s' -f $tgRate) -NoNewline -ForegroundColor Green
+        Write-Host '  ' -NoNewline
+    }
+    if ($null -ne $active) {
+        Write-Host '| ' -NoNewline -ForegroundColor DarkGray
+        Write-Host "active $active" -NoNewline -ForegroundColor White
+    }
+    if ($null -ne $queue) {
+        Write-Host "  queue $queue" -NoNewline -ForegroundColor DarkGray
+    }
+    Write-Host ''
+
+    if ($LogFile) { Add-Content -Path $LogFile -Value $plain -Encoding UTF8 }
+}
+
 # ── Start capture proxy if requested ─────────────────────────────────────────
 $captureJob = $null
 if ($CaptureRequests) {
@@ -422,6 +514,12 @@ if ($CaptureRequests) {
     Write-Host "  Capture proxy started     : :$vsCodePort → OVMS :$($cfg.RestPort)" -ForegroundColor Magenta
     Write-Host "  Request bodies saved to   : $captureDir`n" -ForegroundColor Magenta
 }
+
+# Metrics polling state (populated after server ready)
+$metricsUrl      = "http://localhost:$($cfg.RestPort)/metrics"
+$lastMetricsPoll = [DateTime]::MinValue
+$prevMetSnap     = $null
+$prevMetTime     = $null
 
 Write-Host "Waiting for model to load  (Ctrl+C to stop)...`n"
 
@@ -470,6 +568,23 @@ try {
                 Write-Host ""
             }
         }
+
+        # Poll /metrics and display PP / TG throughput whenever tokens were processed
+        if ($ready) {
+            $now = [DateTime]::UtcNow
+            if (($now - $lastMetricsPoll).TotalMilliseconds -ge 2000) {
+                $snap = Get-OvmsMetrics $metricsUrl
+                if ($snap) {
+                    $elapsed = if ($prevMetTime) { ($now - $prevMetTime).TotalSeconds } else { 0 }
+                    Show-ThroughputLine -Curr $snap -Prev $prevMetSnap `
+                        -ElapsedSec $elapsed -LogFile $resolvedLogFile
+                    $prevMetSnap = $snap
+                    $prevMetTime = $now
+                }
+                $lastMetricsPoll = $now
+            }
+        }
+
         Start-Sleep -Milliseconds 100
     }
 } finally {
